@@ -1,4 +1,4 @@
-         # Student Benefits Scraper
+# Student Benefits Scraper
 
 A hardened, controlled web scraping system designed to discover student discount and benefit pages. Built with defensive architecture, bounded growth, and continuous safe operation guarantees.
 
