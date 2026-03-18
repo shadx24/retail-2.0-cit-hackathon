@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  retail-agent:
+    build: .
+    container_name: retail-price-agent
+    restart: unless-stopped
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s

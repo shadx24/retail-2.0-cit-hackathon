@@ -1,0 +1,828 @@
+"""
+Retail PriceGuard — Backend API Server
+
+Connects the React frontend to Supabase + Web Agent.
+Uses the same Supabase schema as the retail-agent.
+
+Endpoints:
+  POST /api/shop/setup         — Register shop, seed initial data, return scrapedData
+  POST /api/scan/{shop_id}     — Refresh data (generate + persist), return scrapedData
+  GET  /api/data/{shop_id}     — Read current data from Supabase
+  POST /api/agent/start/{id}   — Start web agent in background
+  GET  /api/agent/status/{id}  — Check agent process status
+  POST /api/agent/stop/{id}    — Stop web agent
+  GET  /api/health             — Health check
+"""
+
+import os
+import sys
+import math
+import random
+import hashlib
+import json
+import subprocess
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Load .env from retail-agent/
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'retail-agent', '.env')
+load_dotenv(env_path)
+
+from supabase import create_client, Client
+
+# ═══════════════════════════════════════════════════════════════════
+# APP SETUP
+# ═══════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="Retail PriceGuard API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+db: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        db = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print(f"[Server] Supabase connected: {SUPABASE_URL[:40]}...")
+    except Exception as e:
+        print(f"[Server] Supabase connection failed: {e}")
+else:
+    print("[Server] WARNING: SUPABASE_URL or SUPABASE_KEY not set.")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONSTANTS — Must match frontend (src/data/constants.js)
+# ═══════════════════════════════════════════════════════════════════
+
+COMPETITORS = [
+    {'domain': 'amazon.in',          'name': 'Amazon.in'},
+    {'domain': 'flipkart.com',       'name': 'Flipkart'},
+    {'domain': 'croma.com',          'name': 'Croma'},
+    {'domain': 'reliancedigital.in', 'name': 'Reliance Digital'},
+    {'domain': 'vijaysales.com',     'name': 'Vijay Sales'},
+]
+
+COMPETITOR_NAMES = [c['name'] for c in COMPETITORS]
+DOMAIN_TO_NAME = {c['domain']: c['name'] for c in COMPETITORS}
+NAME_TO_DOMAIN = {c['name']: c['domain'] for c in COMPETITORS}
+
+# Price ranges per product — mirrors src/data/mockDataGenerator.js PRICE_MAP
+PRICE_MAP = {
+    'iPhone':              {'base': 79990,  'variance': 8000},
+    'Sony headphones':     {'base': 19990,  'variance': 3000},
+    'MacBook':             {'base': 129990, 'variance': 12000},
+    'Samsung S24':         {'base': 74999,  'variance': 7000},
+    'Gaming Laptop':       {'base': 89990,  'variance': 10000},
+    'Nike Jordans':        {'base': 12995,  'variance': 2000},
+    'Levis 501':           {'base': 3499,   'variance': 600},
+    'Adidas Originals':    {'base': 7999,   'variance': 1200},
+    'Smart Watch':         {'base': 24999,  'variance': 4000},
+    'Tote Bag':            {'base': 2999,   'variance': 500},
+    'Air Fryer':           {'base': 4999,   'variance': 1500},
+    'Washing Machine':     {'base': 28990,  'variance': 5000},
+    'Smart TV':            {'base': 34990,  'variance': 6000},
+    'Microwave':           {'base': 8990,   'variance': 1500},
+    'AC':                  {'base': 35990,  'variance': 5000},
+    'RTX 4080':            {'base': 119990, 'variance': 10000},
+    'Mechanical Keyboard': {'base': 6999,   'variance': 1500},
+    'Gaming Mouse':        {'base': 3499,   'variance': 800},
+    'PS5 Console':         {'base': 49990,  'variance': 4000},
+    'OLED Monitor':        {'base': 54990,  'variance': 6000},
+}
+
+MODEL_SUFFIXES = ['Pro', 'Plus', 'Ultra', 'Lite', 'Max', 'SE', 'Neo', 'Air']
+
+HIGH_VOLATILITY_KEYWORDS = [
+    'iPhone', 'RTX 4080', 'PS5 Console', 'Gaming Laptop', 'MacBook', 'Nike Jordans'
+]
+
+# Domain → keywords (mirrors src/data/constants.js DOMAINS)
+DOMAIN_CATEGORIES = {
+    'electronics': {
+        'keywords': ['iPhone', 'Sony headphones', 'MacBook', 'Samsung S24', 'Gaming Laptop'],
+        'name': 'Electronics',
+    },
+    'fashion': {
+        'keywords': ['Nike Jordans', 'Levis 501', 'Adidas Originals', 'Smart Watch', 'Tote Bag'],
+        'name': 'Fashion',
+    },
+    'appliances': {
+        'keywords': ['Air Fryer', 'Washing Machine', 'Smart TV', 'Microwave', 'AC'],
+        'name': 'Home Appliances',
+    },
+    'gaming': {
+        'keywords': ['RTX 4080', 'Mechanical Keyboard', 'Gaming Mouse', 'PS5 Console', 'OLED Monitor'],
+        'name': 'Gaming Gear',
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# IN-MEMORY FALLBACK — Works even when Supabase is unavailable
+# ═══════════════════════════════════════════════════════════════════
+
+_shop_cache: Dict[int, Dict] = {}
+_next_fallback_id = 9000
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA GENERATION — Matches frontend scrapedData shape exactly
+# ═══════════════════════════════════════════════════════════════════
+
+def _seeded_random(seed: int) -> float:
+    """Deterministic random matching the frontend's seededRandom()."""
+    x = math.sin(seed) * 10000
+    return x - math.floor(x)
+
+
+def generate_scraped_data(keywords: List[str], domain_id: str = "electronics") -> List[Dict]:
+    """
+    Generate realistic competitor price data in the exact shape the frontend expects.
+
+    Returns: list of { id, name, price, competitor, timestamp, volatility, isNew }
+    """
+    if not keywords:
+        keywords = [
+            'Specialty Item Alpha', 'Custom Product Beta',
+            'Premium Goods Gamma', 'Niche Solution Delta', 'Global Supply Echo',
+        ]
+
+    data = []
+    seed_counter = 1
+
+    for p_idx, product_name in enumerate(keywords):
+        price_info = PRICE_MAP.get(product_name, {'base': 14999, 'variance': 3000})
+        suffix = MODEL_SUFFIXES[p_idx % len(MODEL_SUFFIXES)]
+        is_high_vol = product_name in HIGH_VOLATILITY_KEYWORDS
+        full_name = f"{product_name} {suffix}"
+
+        for c_idx, comp_name in enumerate(COMPETITOR_NAMES):
+            seed_counter += 1
+            rand = _seeded_random(seed_counter)
+
+            # Price: deterministic base + small random jitter per scan
+            base_offset = round((rand - 0.5) * 2 * price_info['variance'])
+            scan_jitter = random.randint(
+                -int(price_info['variance'] * 0.15),
+                int(price_info['variance'] * 0.15),
+            )
+            price = max(499, price_info['base'] + base_offset + scan_jitter)
+
+            # Volatility: deterministic per product-competitor (consistent across scans)
+            if is_high_vol:
+                vol_base = 6.5 + rand * 3.5   # 6.5 – 10.0
+            else:
+                vol_base = 1.0 + rand * 6.0   # 1.0 – 7.0
+            volatility = min(10.0, max(0.5, vol_base))
+
+            # Emerging: ~15% chance, biased toward less common competitors
+            is_new = c_idx >= 3 and rand > 0.65
+
+            item_id = (
+                f"{product_name.replace(' ', '').lower()}"
+                f"-{comp_name.replace(' ', '').replace('.', '').lower()}"
+                f"-{seed_counter}"
+            )
+
+            data.append({
+                'id': item_id,
+                'name': full_name,
+                'price': price,
+                'competitor': comp_name,
+                'timestamp': datetime.utcnow().isoformat(),
+                'volatility': f"{volatility:.1f}",
+                'isNew': is_new,
+            })
+
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SUPABASE OPERATIONS — Best-effort persistence
+# ═══════════════════════════════════════════════════════════════════
+
+def _ensure_competitor_domains():
+    """Insert the 5 known competitor domains into the domains table."""
+    if not db:
+        return
+    try:
+        for comp in COMPETITORS:
+            db.table("domains").upsert({
+                "domain": comp['domain'],
+                "trust_score": 80.0 + random.randint(0, 20),
+                "last_seen": datetime.utcnow().isoformat(),
+                "offer_count": random.randint(50, 150),
+                "spam_count": 0,
+                "is_blacklisted": False,
+            }, on_conflict="domain").execute()
+    except Exception as e:
+        print(f"[Server] Could not seed domains: {e}")
+
+
+def _create_or_get_shop(shop_name: str, category: str, description: str = "",
+                         shop_domain: str = "") -> Optional[int]:
+    """Create or retrieve a shop in the shops table. Returns shop_id."""
+    if not db:
+        return None
+    try:
+        # Check exists
+        result = db.table("shops") \
+            .select("id") \
+            .eq("shop_name", shop_name) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            return result.data[0]["id"]
+
+        # Create
+        if not shop_domain:
+            shop_domain = f"{shop_name.lower().replace(' ', '-')}.com"
+        result = db.table("shops").insert({
+            "shop_name": shop_name,
+            "shop_domain": shop_domain,
+            "category": category,
+            "description": description,
+            "is_active": True,
+            "created_at": datetime.utcnow().isoformat(),
+            "last_active": datetime.utcnow().isoformat(),
+        }).execute()
+        if result.data:
+            return result.data[0]["id"]
+    except Exception as e:
+        print(f"[Server] Could not create/get shop: {e}")
+    return None
+
+
+def _seed_competitor_prices(shop_id: Optional[int], scraped_data: List[Dict]):
+    """Persist generated data into Supabase competitor_prices table."""
+    if not db:
+        return
+    try:
+        # Remove previous seeded data for this shop (keep it fresh)
+        if shop_id:
+            try:
+                db.table("competitor_prices") \
+                    .delete() \
+                    .eq("shop_id", shop_id) \
+                    .execute()
+            except Exception:
+                pass
+
+        records = []
+        for item in scraped_data:
+            domain = NAME_TO_DOMAIN.get(item['competitor'], 'unknown.com')
+            record = {
+                "domain": domain,
+                "url": f"https://{domain}/p/{item['id']}",
+                "product_name": item['name'],
+                "price": item['price'],
+                "currency": "INR",
+                "competitor_name": item['competitor'],
+                "category": "retail",
+                "scraped_at": item['timestamp'],
+            }
+            if shop_id:
+                record["shop_id"] = shop_id
+            records.append(record)
+
+        # Batch insert (50 at a time)
+        for i in range(0, len(records), 50):
+            batch = records[i:i + 50]
+            try:
+                db.table("competitor_prices").insert(batch).execute()
+            except Exception as e:
+                # Retry without shop_id (if column doesn't exist)
+                try:
+                    for r in batch:
+                        r.pop("shop_id", None)
+                    db.table("competitor_prices").insert(batch).execute()
+                except Exception as e2:
+                    print(f"[Server] Price insert failed: {e2}")
+                    break
+
+        print(f"[Server] Seeded {len(records)} competitor prices for shop {shop_id}")
+    except Exception as e:
+        print(f"[Server] Seed prices error: {e}")
+
+
+def _seed_product_metadata(shop_id: Optional[int], scraped_data: List[Dict]):
+    """Seed product_metadata table for emerging product detection."""
+    if not db or not shop_id:
+        return
+    try:
+        seen = set()
+        records = []
+        for item in scraped_data:
+            name = item['name']
+            if name in seen:
+                continue
+            seen.add(name)
+            records.append({
+                "shop_id": shop_id,
+                "product_name": name,
+                "category": "retail",
+                "first_seen": item['timestamp'],
+                "is_emerging": item.get('isNew', False),
+                "trending_score": float(item.get('volatility', 0)),
+            })
+
+        for record in records:
+            try:
+                db.table("product_metadata") \
+                    .upsert(record, on_conflict="shop_id,product_name") \
+                    .execute()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Server] Seed metadata error: {e}")
+
+
+def _seed_product_volatility(shop_id: Optional[int], scraped_data: List[Dict]):
+    """Seed product_volatility table."""
+    if not db or not shop_id:
+        return
+    try:
+        # Group prices by product
+        product_prices: Dict[str, List[float]] = {}
+        for item in scraped_data:
+            name = item['name']
+            if name not in product_prices:
+                product_prices[name] = []
+            product_prices[name].append(float(item['price']))
+
+        for name, prices in product_prices.items():
+            if len(prices) < 2:
+                continue
+            import statistics
+            avg_p = statistics.mean(prices)
+            min_p = min(prices)
+            max_p = max(prices)
+            try:
+                stddev = statistics.stdev(prices)
+                var = statistics.variance(prices)
+            except Exception:
+                stddev = 0.0
+                var = 0.0
+
+            try:
+                db.table("product_volatility").upsert({
+                    "shop_id": shop_id,
+                    "product_name": name,
+                    "avg_price": round(avg_p, 2),
+                    "min_price": round(min_p, 2),
+                    "max_price": round(max_p, 2),
+                    "volatility_score": round(stddev, 2),
+                    "price_variance": round(var, 2),
+                    "sample_count": len(prices),
+                    "last_calculated": datetime.utcnow().isoformat(),
+                }, on_conflict="shop_id,product_name").execute()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Server] Seed volatility error: {e}")
+
+
+def _read_from_supabase(shop_id: int) -> Optional[List[Dict]]:
+    """Read competitor_prices from Supabase and transform to frontend format."""
+    if not db or not shop_id:
+        return None
+    try:
+        result = db.table("competitor_prices") \
+            .select("*") \
+            .eq("shop_id", shop_id) \
+            .order("scraped_at", desc=True) \
+            .limit(500) \
+            .execute()
+
+        if not result.data or len(result.data) < 3:
+            return None
+
+        return _transform_db_to_frontend(result.data)
+    except Exception as e:
+        print(f"[Server] Supabase read error: {e}")
+        return None
+
+
+def _transform_db_to_frontend(rows: List[Dict]) -> List[Dict]:
+    """Transform Supabase competitor_prices rows → frontend scrapedData shape."""
+    data = []
+    for row in rows:
+        domain = row.get('domain', '')
+        competitor = DOMAIN_TO_NAME.get(domain, row.get('competitor_name', domain))
+
+        product_name = row.get('product_name', 'Unknown')
+        base_product = product_name.split(' ')[0] if product_name else ''
+        is_high_vol = base_product in HIGH_VOLATILITY_KEYWORDS
+
+        # Deterministic volatility from product name hash
+        name_hash = int(hashlib.md5(f"{product_name}-{domain}".encode()).hexdigest()[:8], 16)
+        norm = name_hash / 0xFFFFFFFF
+        if is_high_vol:
+            volatility = round(6.5 + norm * 3.5, 1)
+        else:
+            volatility = round(1.0 + norm * 6.0, 1)
+
+        # isNew based on recency or competitor position
+        scraped_at_str = row.get('scraped_at', '')
+        is_new = False
+        try:
+            scraped_at = datetime.fromisoformat(scraped_at_str.replace('Z', '+00:00'))
+            hours_old = (datetime.utcnow() - scraped_at.replace(tzinfo=None)).total_seconds() / 3600
+            is_new = hours_old < 24 and norm > 0.65
+        except Exception:
+            pass
+
+        price_val = float(row.get('price', 0)) if row.get('price') else 0
+
+        data.append({
+            'id': str(row.get('id', '')),
+            'name': product_name,
+            'price': price_val,
+            'competitor': competitor,
+            'timestamp': scraped_at_str or datetime.utcnow().isoformat(),
+            'volatility': f"{volatility:.1f}",
+            'isNew': is_new,
+        })
+
+    return data
+
+
+def _get_shop_keywords(shop_id: int) -> tuple:
+    """Get keywords and category for a shop from Supabase or cache."""
+    # Try cache first
+    if shop_id in _shop_cache:
+        cached = _shop_cache[shop_id]
+        return cached.get('keywords', []), cached.get('category', 'electronics')
+
+    # Try Supabase
+    if db:
+        try:
+            result = db.table("shops") \
+                .select("category") \
+                .eq("id", shop_id) \
+                .limit(1) \
+                .execute()
+            if result.data:
+                category = result.data[0].get("category", "electronics")
+                config = DOMAIN_CATEGORIES.get(category, {})
+                keywords = config.get('keywords', [])
+                return keywords, category
+        except Exception:
+            pass
+
+    # Default fallback
+    return DOMAIN_CATEGORIES['electronics']['keywords'], 'electronics'
+
+
+# ═══════════════════════════════════════════════════════════════════
+# REQUEST / RESPONSE MODELS
+# ═══════════════════════════════════════════════════════════════════
+
+class ShopSetupRequest(BaseModel):
+    shopName: str
+    domainId: str
+    domainName: str
+    keywords: List[str] = []
+    customDescription: str = ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.post("/api/shop/setup")
+async def setup_shop(req: ShopSetupRequest, background_tasks: BackgroundTasks):
+    """
+    Register a shop and return initial scraped data.
+
+    1. Creates/gets the shop in Supabase
+    2. Ensures competitor domains exist
+    3. Generates realistic price data
+    4. Seeds data into Supabase (background)
+    5. Returns data immediately
+    """
+    global _next_fallback_id
+
+    # Determine keywords
+    domain_config = DOMAIN_CATEGORIES.get(req.domainId, {})
+    keywords = req.keywords if req.keywords else domain_config.get('keywords', [])
+    category = req.domainId if req.domainId != 'custom' else 'custom'
+
+    # Generate data immediately (fast)
+    scraped_data = generate_scraped_data(keywords, req.domainId)
+
+    # Create shop in Supabase (best-effort)
+    _ensure_competitor_domains()
+    shop_id = _create_or_get_shop(req.shopName, category, req.customDescription)
+
+    if not shop_id:
+        # Fallback: in-memory shop ID
+        shop_id = _next_fallback_id
+        _next_fallback_id += 1
+
+    # Cache shop config
+    _shop_cache[shop_id] = {
+        'keywords': keywords,
+        'category': category,
+        'shop_name': req.shopName,
+        'domain_id': req.domainId,
+    }
+
+    # Persist to Supabase in background
+    background_tasks.add_task(_seed_competitor_prices, shop_id, scraped_data)
+    background_tasks.add_task(_seed_product_metadata, shop_id, scraped_data)
+    background_tasks.add_task(_seed_product_volatility, shop_id, scraped_data)
+
+    print(f"[Server] Shop '{req.shopName}' setup complete (ID: {shop_id}, Category: {category})")
+
+    return {
+        "shopId": shop_id,
+        "data": scraped_data,
+    }
+
+
+@app.post("/api/scan/{shop_id}")
+async def run_scan(shop_id: int, background_tasks: BackgroundTasks):
+    """
+    Run a scan cycle for a shop and return fresh data.
+
+    1. Gets shop keywords
+    2. Generates new data with price variation
+    3. Persists to Supabase (background)
+    4. Returns data immediately
+    """
+    keywords, category = _get_shop_keywords(shop_id)
+
+    # Generate fresh data (prices vary each scan due to random jitter)
+    scraped_data = generate_scraped_data(keywords, category)
+
+    # Persist in background
+    background_tasks.add_task(_seed_competitor_prices, shop_id, scraped_data)
+    background_tasks.add_task(_seed_product_metadata, shop_id, scraped_data)
+    background_tasks.add_task(_seed_product_volatility, shop_id, scraped_data)
+
+    # Update shop last_active
+    if db and shop_id < 9000:
+        background_tasks.add_task(
+            lambda: db.table("shops")
+            .update({"last_active": datetime.utcnow().isoformat()})
+            .eq("id", shop_id)
+            .execute()
+        )
+
+    return scraped_data
+
+
+@app.get("/api/data/{shop_id}")
+async def get_data(shop_id: int):
+    """
+    Read current data from Supabase.
+    Falls back to generating data if Supabase has no data.
+    """
+    # Try Supabase first
+    data = _read_from_supabase(shop_id)
+    if data and len(data) >= 5:
+        return data
+
+    # Fallback: generate from known keywords
+    keywords, category = _get_shop_keywords(shop_id)
+    return generate_scraped_data(keywords, category)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# AGENT MANAGEMENT — Start/stop the retail-agent process
+# ═══════════════════════════════════════════════════════════════════
+
+_agent_processes: Dict[int, subprocess.Popen] = {}
+
+
+@app.post("/api/agent/start/{shop_id}")
+async def start_agent(shop_id: int):
+    """Start the autonomous web agent for a shop (background process)."""
+    # Check if already running
+    if shop_id in _agent_processes:
+        proc = _agent_processes[shop_id]
+        if proc.poll() is None:
+            return {"status": "already_running", "pid": proc.pid}
+
+    agent_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', 'retail-agent', 'agent_engine.py',
+    )
+
+    if not os.path.exists(agent_path):
+        raise HTTPException(404, "Agent script not found at retail-agent/agent_engine.py")
+
+    agent_cwd = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', 'retail-agent',
+    )
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, agent_path, str(shop_id)],
+            cwd=agent_cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ},
+        )
+        _agent_processes[shop_id] = proc
+        return {"status": "started", "pid": proc.pid, "shop_id": shop_id}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to start agent: {e}")
+
+
+@app.get("/api/agent/status/{shop_id}")
+async def get_agent_status(shop_id: int):
+    """Check if the web agent is running for a shop."""
+    if shop_id not in _agent_processes:
+        return {"status": "not_started", "shop_id": shop_id}
+
+    proc = _agent_processes[shop_id]
+    if proc.poll() is None:
+        return {"status": "running", "pid": proc.pid, "shop_id": shop_id}
+    else:
+        return {
+            "status": "stopped",
+            "return_code": proc.returncode,
+            "shop_id": shop_id,
+        }
+
+
+@app.post("/api/agent/stop/{shop_id}")
+async def stop_agent(shop_id: int):
+    """Stop the web agent for a shop."""
+    if shop_id not in _agent_processes:
+        return {"status": "not_running", "shop_id": shop_id}
+
+    proc = _agent_processes[shop_id]
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return {"status": "stopped", "shop_id": shop_id}
+
+    return {"status": "already_stopped", "shop_id": shop_id}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ANALYTICS ENDPOINTS — Read analytics from Supabase
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/analytics/volatility/{shop_id}")
+async def get_volatility(shop_id: int):
+    """Get price volatility data for a shop."""
+    if not db:
+        return []
+    try:
+        result = db.table("product_volatility") \
+            .select("*") \
+            .eq("shop_id", shop_id) \
+            .order("volatility_score", desc=True) \
+            .limit(50) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        return []
+
+
+@app.get("/api/analytics/emerging/{shop_id}")
+async def get_emerging(shop_id: int):
+    """Get emerging products for a shop."""
+    if not db:
+        return []
+    try:
+        result = db.table("emerging_products") \
+            .select("*") \
+            .eq("shop_id", shop_id) \
+            .order("created_at", desc=True) \
+            .limit(50) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        return []
+
+
+@app.get("/api/analytics/drops/{shop_id}")
+async def get_price_drops(shop_id: int):
+    """Get detected price drops for a shop."""
+    if not db:
+        return []
+    try:
+        result = db.table("price_drops") \
+            .select("*") \
+            .eq("shop_id", shop_id) \
+            .order("detected_at", desc=True) \
+            .limit(50) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        return []
+
+
+@app.get("/api/analytics/coverage/{shop_id}")
+async def get_coverage(shop_id: int):
+    """Get competitor coverage data for a shop."""
+    if not db:
+        return []
+    try:
+        result = db.table("competitor_coverage") \
+            .select("*") \
+            .eq("shop_id", shop_id) \
+            .order("market_share_percent", desc=True) \
+            .limit(50) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SYSTEM ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/health")
+async def health():
+    """Health check."""
+    supabase_ok = False
+    if db:
+        try:
+            db.table("domains").select("domain").limit(1).execute()
+            supabase_ok = True
+        except Exception:
+            pass
+
+    return {
+        "status": "ok",
+        "supabase": "connected" if supabase_ok else "disconnected",
+        "timestamp": datetime.utcnow().isoformat(),
+        "active_agents": sum(
+            1 for p in _agent_processes.values() if p.poll() is None
+        ),
+    }
+
+
+@app.get("/api/stats")
+async def get_stats():
+    """Get system-wide statistics."""
+    stats = {
+        "shops": 0,
+        "total_prices": 0,
+        "total_domains": 0,
+        "active_keywords": 0,
+    }
+    if not db:
+        return stats
+    try:
+        shops = db.table("shops").select("*", count="exact").execute()
+        stats["shops"] = shops.count or 0
+    except Exception:
+        pass
+    try:
+        prices = db.table("competitor_prices").select("*", count="exact").execute()
+        stats["total_prices"] = prices.count or 0
+    except Exception:
+        pass
+    try:
+        domains = db.table("domains").select("*", count="exact").execute()
+        stats["total_domains"] = domains.count or 0
+    except Exception:
+        pass
+    try:
+        kw = db.table("keyword_pool") \
+            .select("*", count="exact") \
+            .eq("is_active", True) \
+            .execute()
+        stats["active_keywords"] = kw.count or 0
+    except Exception:
+        pass
+    return stats
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n" + "=" * 60)
+    print("  RETAIL PRICEGUARD — Backend API Server")
+    print("  http://localhost:8000")
+    print("  Docs: http://localhost:8000/docs")
+    print("=" * 60 + "\n")
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
